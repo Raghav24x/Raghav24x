@@ -1,0 +1,711 @@
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Root
+mkdir -p hala-madrid-housing
+cd hala-madrid-housing
+
+echo "Creating directory tree…"
+mkdir -p database backend/edge-functions backend/supabase/migrations frontend/components frontend/hooks frontend/pages/api frontend/pages frontend/lib ai-models
+
+########################################
+# database/schema.sql
+########################################
+cat > database/schema.sql <<'SQL'
+-- Enable required extensions
+create extension if not exists pgcrypto;
+create extension if not exists http with schema public; -- optional
+
+-- Users (mirror of auth.users)
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  full_name text,
+  created_at timestamptz default now()
+);
+
+-- Neighborhoods\ ncreate table if not exists public.neighborhoods (
+  id bigserial primary key,
+  name text unique not null,
+  safety_index numeric check (safety_index between 0 and 1),
+  metro_proximity boolean default false,
+  walkability_score numeric check (walkability_score between 0 and 1),
+  geom geometry, -- optional if using PostGIS; otherwise drop
+  created_at timestamptz default now()
+);
+
+-- Properties
+create table if not exists public.properties (
+  id bigserial primary key,
+  title text not null,
+  price numeric not null check (price >= 0),
+  bedrooms int,
+  bathrooms int,
+  size_m2 numeric,
+  address text,
+  neighborhood_id bigint references public.neighborhoods(id) on delete set null,
+  owner_id uuid references auth.users(id) on delete set null,
+  listed_at timestamptz default now(),
+  images text[] default '{}'
+);
+
+-- User preferences
+create table if not exists public.user_preferences (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  max_budget numeric,
+  preferred_districts text[] default '{}',
+  must_have_metro boolean default false,
+  min_walkability numeric default 0,
+  updated_at timestamptz default now()
+);
+
+-- Helpful indexes
+create index if not exists idx_properties_price on public.properties(price);
+create index if not exists idx_properties_neighborhood on public.properties(neighborhood_id);
+create index if not exists idx_neighborhoods_name on public.neighborhoods(name);
+create index if not exists idx_user_prefs_user on public.user_preferences(user_id);
+SQL
+
+########################################
+# database/functions.sql
+########################################
+cat > database/functions.sql <<'SQL'
+-- Property matching (price + district fit)
+create or replace function public.match_properties(
+  p_user_id uuid,
+  p_max_budget numeric,
+  p_preferred_districts text[],
+  p_price_weight numeric default 0.5,
+  p_district_weight numeric default 0.5,
+  p_limit integer default 10
+)
+returns table (
+  property_id bigint,
+  match_score numeric
+)
+language sql
+as $$
+  with prefs as (
+    select array_remove(p_preferred_districts, null) as districts
+  ),
+  priced as (
+    select
+      p.id as property_id,
+      greatest(0, least(1,
+        1 - (abs(p.price - p_max_budget) / nullif(p_max_budget, 0))
+      )) as price_score,
+      p.neighborhood_id
+    from public.properties p
+    where p.price is not null and p.price >= 0
+      and (p_max_budget is null or p.price <= p_max_budget)
+  ),
+  district_fit as (
+    select
+      pr.property_id,
+      case
+        when prefs.districts is null or cardinality(prefs.districts) = 0 then 0
+        when n.name = any(prefs.districts) then 1
+        else 0
+      end as district_score
+    from priced pr
+    left join public.neighborhoods n on n.id = pr.neighborhood_id
+    cross join prefs
+  )
+  select
+    pr.property_id,
+    round((pr.price_score * p_price_weight) + (df.district_score * p_district_weight), 4) as match_score
+  from priced pr
+  join district_fit df using (property_id)
+  order by match_score desc, pr.property_id
+  limit coalesce(p_limit, 10);
+$$;
+
+-- Neighborhood recommender
+create or replace function public.recommend_neighborhoods(
+  p_user_id uuid,
+  p_safety_weight numeric default 0.3,
+  p_metro_weight  numeric default 0.2,
+  p_walk_weight   numeric default 0.5,
+  p_limit integer default 5
+)
+returns table (
+  neighborhood_name text,
+  recommendation_score numeric
+)
+language sql
+as $$
+  with base as (
+    select
+      n.name,
+      coalesce(n.safety_index, 0)     as safety_norm,
+      case when coalesce(n.metro_proximity, false) then 1 else 0 end as metro_norm,
+      coalesce(n.walkability_score, 0) as walk_norm
+    from public.neighborhoods n
+  )
+  select
+    b.name as neighborhood_name,
+    round((b.safety_norm * p_safety_weight) + (b.metro_norm * p_metro_weight) + (b.walk_norm * p_walk_weight), 4) as recommendation_score
+  from base b
+  order by recommendation_score desc, neighborhood_name
+  limit coalesce(p_limit, 5);
+$$;
+SQL
+
+########################################
+# database/policies.sql
+########################################
+cat > database/policies.sql <<'SQL'
+-- Enable RLS
+alter table public.neighborhoods enable row level security;
+alter table public.properties enable row level security;
+alter table public.user_preferences enable row level security;
+
+-- Neighborhoods: public readable, no writes
+drop policy if exists "Public can view neighborhood data" on public.neighborhoods;
+create policy "Public can view neighborhood data"
+on public.neighborhoods
+for select using (true);
+
+create policy if not exists "Neighborhoods: no public inserts"
+on public.neighborhoods for insert to public with check (false);
+create policy if not exists "Neighborhoods: no public updates"
+on public.neighborhoods for update to public using (false) with check (false);
+create policy if not exists "Neighborhoods: no public deletes"
+on public.neighborhoods for delete to public using (false);
+
+-- Properties: public can view affordable; authenticated can view all; owners manage their rows
+drop policy if exists "Public can view affordable properties" on public.properties;
+create policy "Public can view affordable properties"
+on public.properties for select to anon, authenticated
+using (coalesce(price, 1e15) < 500000);
+
+drop policy if exists "Authenticated users can view all properties" on public.properties;
+create policy "Authenticated users can view all properties"
+on public.properties for select to authenticated using (auth.role() = 'authenticated');
+
+-- Ownership-based writes (requires owner_id)
+create policy if not exists "Owners can insert their properties"
+on public.properties for insert to authenticated with check (owner_id = auth.uid());
+create policy if not exists "Owners can update their properties"
+on public.properties for update to authenticated using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+create policy if not exists "Owners can delete their properties"
+on public.properties for delete to authenticated using (owner_id = auth.uid());
+
+-- User preferences: private per user
+create policy if not exists "Users can read own preferences"
+on public.user_preferences for select to authenticated using (auth.uid() = user_id);
+create policy if not exists "Users can insert own preferences"
+on public.user_preferences for insert to authenticated with check (auth.uid() = user_id);
+create policy if not exists "Users can update own preferences"
+on public.user_preferences for update to authenticated using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy if not exists "Users can delete own preferences"
+on public.user_preferences for delete to authenticated using (auth.uid() = user_id);
+SQL
+
+########################################
+# Edge Functions (Deno)
+########################################
+cat > backend/edge-functions/property-matching.ts <<'TS'
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+export default async function handler(req: Request) {
+  const url = Deno.env.get("SUPABASE_URL")!;
+  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  const supabase = createClient(url, key);
+
+  try {
+    const { user_id, max_budget, preferred_districts, limit } = await req.json();
+    const { data, error } = await supabase.rpc("match_properties", {
+      p_user_id: user_id,
+      p_max_budget: max_budget,
+      p_preferred_districts: preferred_districts ?? [],
+      p_price_weight: 0.5,
+      p_district_weight: 0.5,
+      p_limit: limit ?? 10,
+    });
+    if (error) throw error;
+    return new Response(JSON.stringify({ ok: true, data }), { headers: { "Content-Type": "application/json" } });
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: String(e) }), { status: 400 });
+  }
+}
+
+Deno.serve(handler);
+TS
+
+cat > backend/edge-functions/user-preferences.ts <<'TS'
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+export default async function handler(req: Request) {
+  const url = Deno.env.get("SUPABASE_URL")!;
+  const anon = Deno.env.get("SUPABASE_ANON_KEY")!;
+  const jwt = req.headers.get("Authorization")?.replace("Bearer ", "");
+  const supabase = createClient(url, anon, { global: { headers: { Authorization: `Bearer ${jwt}` } } });
+
+  try {
+    if (req.method === "GET") {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return new Response("Unauthorized", { status: 401 });
+      const { data, error } = await supabase.from("user_preferences").select("*").eq("user_id", user.id).single();
+      if (error) throw error;
+      return new Response(JSON.stringify({ ok: true, data }), { headers: { "Content-Type": "application/json" } });
+    }
+
+    if (req.method === "POST" || req.method === "PUT") {
+      const body = await req.json();
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return new Response("Unauthorized", { status: 401 });
+      const payload = { ...body, user_id: user.id };
+      const { data, error } = await supabase
+        .from("user_preferences")
+        .upsert(payload, { onConflict: "user_id" })
+        .select()
+        .single();
+      if (error) throw error;
+      return new Response(JSON.stringify({ ok: true, data }), { headers: { "Content-Type": "application/json" } });
+    }
+
+    return new Response("Method not allowed", { status: 405 });
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: String(e) }), { status: 400 });
+  }
+}
+
+Deno.serve(handler);
+TS
+
+cat > backend/edge-functions/recommendation-engine.ts <<'TS'
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+export default async function handler(req: Request) {
+  const url = Deno.env.get("SUPABASE_URL")!;
+  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  const supabase = createClient(url, key);
+
+  try {
+    const { user_id, limit } = await req.json();
+    const { data, error } = await supabase.rpc("recommend_neighborhoods", {
+      p_user_id: user_id,
+      p_limit: limit ?? 5,
+    });
+    if (error) throw error;
+    return new Response(JSON.stringify({ ok: true, data }), { headers: { "Content-Type": "application/json" } });
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: String(e) }), { status: 400 });
+  }
+}
+
+Deno.serve(handler);
+TS
+
+########################################
+# Supabase config
+########################################
+cat > backend/supabase/config.toml <<'TOML'
+[project]
+id = "hala-madrid-housing"
+
+[functions]
+verify_jwt = true
+
+[functions.property-matching]
+verify_jwt = false
+
+[functions.user-preferences]
+verify_jwt = true
+
+[functions.recommendation-engine]
+verify_jwt = false
+TOML
+
+########################################
+# Frontend files
+########################################
+# package.json
+cat > frontend/package.json <<'JSON'
+{
+  "name": "hala-madrid-frontend",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "next": "^14.2.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/node": "^20.12.12",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0"
+  }
+}
+JSON
+
+# tsconfig.json
+cat > frontend/tsconfig.json <<'JSON'
+{
+  "compilerOptions": {
+    "target": "es2020",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "baseUrl": "."
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules"]
+}
+JSON
+
+# next.config.js
+cat > frontend/next.config.js <<'JS'
+/** @type {import('next').NextConfig} */
+const nextConfig = { reactStrictMode: true };
+module.exports = nextConfig;
+JS
+
+# .env.local example
+cat > frontend/.env.local.example <<'ENV'
+NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
+EDGE_BASE_URL=http://127.0.0.1:54321/functions/v1
+ENV
+
+# lib/supabaseClient.ts
+cat > frontend/lib/supabaseClient.ts <<'TS'
+import { createClient } from "@supabase/supabase-js";
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+TS
+
+# components
+cat > frontend/components/PropertySearch.tsx <<'TSX'
+import { useState } from "react";
+
+type Props = { onSearch: (q: { maxBudget?: number; districts: string[] }) => void };
+export default function PropertySearch({ onSearch }: Props) {
+  const [budget, setBudget] = useState("");
+  const [districts, setDistricts] = useState("");
+  return (
+    <div className="w-full max-w-xl space-y-3 rounded-2xl p-4 shadow">
+      <h2 className="text-xl font-semibold">Find your next place</h2>
+      <input className="w-full rounded border p-2" placeholder="Max budget (€)" value={budget} onChange={(e) => setBudget(e.target.value)} inputMode="numeric" />
+      <input className="w-full rounded border p-2" placeholder="Preferred districts (comma-separated)" value={districts} onChange={(e) => setDistricts(e.target.value)} />
+      <button className="rounded-2xl px-4 py-2 font-medium shadow" onClick={() => onSearch({ maxBudget: budget ? Number(budget) : undefined, districts: districts.split(",").map(s => s.trim()).filter(Boolean) })}>Search</button>
+    </div>
+  );
+}
+TSX
+
+cat > frontend/components/NeighborhoodMap.tsx <<'TSX'
+export default function NeighborhoodMap({ neighborhoods }: { neighborhoods: { name: string; score: number }[] }) {
+  return (
+    <div className="w-full rounded-2xl border p-4">
+      <h3 className="mb-2 text-lg font-semibold">Neighborhood recommendations</h3>
+      <ul className="space-y-1">
+        {neighborhoods.map((n) => (
+          <li key={n.name} className="flex justify-between rounded bg-gray-50 p-2">
+            <span>{n.name}</span>
+            <span className="tabular-nums">{n.score.toFixed(2)}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+TSX
+
+cat > frontend/components/UserPreferencesForm.tsx <<'TSX'
+import { useState, useEffect } from "react";
+
+export default function UserPreferencesForm() {
+  const [maxBudget, setMaxBudget] = useState("");
+  const [districts, setDistricts] = useState("");
+  const [metro, setMetro] = useState(false);
+  const [walk, setWalk] = useState("0");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const res = await fetch("/api/user-preferences");
+      if (res.ok) {
+        const { data } = await res.json();
+        if (data) {
+          setMaxBudget(data.max_budget ?? "");
+          setDistricts((data.preferred_districts ?? []).join(", "));
+          setMetro(!!data.must_have_metro);
+          setWalk(String(data.min_walkability ?? 0));
+        }
+      }
+    })();
+  }, []);
+
+  async function save() {
+    setSaving(true);
+    await fetch("/api/user-preferences", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ max_budget: maxBudget ? Number(maxBudget) : null, preferred_districts: districts.split(",").map(s=>s.trim()).filter(Boolean), must_have_metro: metro, min_walkability: Number(walk) }) });
+    setSaving(false);
+  }
+
+  return (
+    <div className="space-y-3 rounded-2xl border p-4">
+      <h3 className="text-lg font-semibold">Your preferences</h3>
+      <input className="w-full rounded border p-2" placeholder="Max budget (€)" value={maxBudget} onChange={(e) => setMaxBudget(e.target.value)} />
+      <input className="w-full rounded border p-2" placeholder="Preferred districts" value={districts} onChange={(e) => setDistricts(e.target.value)} />
+      <label className="flex items-center gap-2"><input type="checkbox" checked={metro} onChange={(e) => setMetro(e.target.checked)} /> Must have metro proximity</label>
+      <label className="block"><span>Min walkability (0–1)</span><input className="w-full rounded border p-2" value={walk} onChange={(e) => setWalk(e.target.value)} /></label>
+      <button className="rounded-2xl px-4 py-2 font-medium shadow" onClick={save} disabled={saving}>{saving ? "Saving..." : "Save"}</button>
+    </div>
+  );
+}
+TSX
+
+# hooks
+cat > frontend/hooks/usePropertySearch.ts <<'TS'
+import { useState } from "react";
+
+export function usePropertySearch() {
+  const [results, setResults] = useState<{ property_id: number; match_score: number }[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  async function search(params: { maxBudget?: number; districts: string[] }) {
+    setLoading(true);
+    const res = await fetch("/api/property-matching", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id: null, max_budget: params.maxBudget ?? null, preferred_districts: params.districts ?? [] }) });
+    const json = await res.json();
+    setResults(json.data ?? []);
+    setLoading(false);
+  }
+
+  return { results, loading, search };
+}
+TS
+
+cat > frontend/hooks/useRecommendations.ts <<'TS'
+import { useEffect, useState } from "react";
+
+export function useRecommendations(userId?: string) {
+  const [items, setItems] = useState<{ neighborhood_name: string; recommendation_score: number }[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!userId) return;
+    (async () => {
+      setLoading(true);
+      const res = await fetch("/api/recommendations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id: userId }) });
+      const json = await res.json();
+      setItems(json.data ?? []);
+      setLoading(false);
+    })();
+  }, [userId]);
+
+  return { items, loading };
+}
+TS
+
+# pages
+cat > frontend/pages/index.tsx <<'TSX'
+import Link from "next/link";
+
+export default function Home() {
+  return (
+    <main className="mx-auto max-w-3xl p-6">
+      <h1 className="mb-4 text-3xl font-bold">Hala Madrid 🏡</h1>
+      <p className="mb-6 text-gray-700">Find student-friendly housing in Madrid with smart recommendations.</p>
+      <div className="flex gap-3">
+        <Link className="rounded-2xl bg-black px-4 py-2 text-white" href="/search">Start Searching</Link>
+        <Link className="rounded-2xl border px-4 py-2" href="/profile">Your Profile</Link>
+      </div>
+    </main>
+  );
+}
+TSX
+
+cat > frontend/pages/search.tsx <<'TSX'
+import { usePropertySearch } from "../hooks/usePropertySearch";
+import PropertySearch from "../components/PropertySearch";
+
+export default function SearchPage() {
+  const { results, loading, search } = usePropertySearch();
+  return (
+    <main className="mx-auto max-w-3xl p-6 space-y-6">
+      <PropertySearch onSearch={search} />
+      {loading && <p>Loading…</p>}
+      <ul className="space-y-2">
+        {results.map((r) => (
+          <li key={r.property_id} className="rounded border p-3">
+            <div className="flex items-center justify-between">
+              <span>Property #{r.property_id}</span>
+              <span className="tabular-nums">Score: {r.match_score.toFixed(3)}</span>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+TSX
+
+cat > frontend/pages/profile.tsx <<'TSX'
+import { useEffect, useState } from "react";
+import UserPreferencesForm from "../components/UserPreferencesForm";
+import NeighborhoodMap from "../components/NeighborhoodMap";
+import { useRecommendations } from "../hooks/useRecommendations";
+
+export default function ProfilePage() {
+  const [userId, setUserId] = useState<string | undefined>();
+  const { items, loading } = useRecommendations(userId);
+
+  useEffect(() => {
+    fetch("/api/me").then(async (r) => { const j = await r.json(); setUserId(j.user?.id); });
+  }, []);
+
+  return (
+    <main className="mx-auto max-w-3xl space-y-6 p-6">
+      <UserPreferencesForm />
+      {loading ? <p>Loading recommendations…</p> : <NeighborhoodMap neighborhoods={items.map((i) => ({ name: i.neighborhood_name, score: i.recommendation_score }))} />}
+    </main>
+  );
+}
+TSX
+
+# API routes
+cat > frontend/pages/api/property-matching.ts <<'TS'
+import type { NextApiRequest, NextApiResponse } from "next";
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== "POST") return res.status(405).end();
+  const { user_id, max_budget, preferred_districts, limit } = req.body || {};
+  const url = process.env.EDGE_BASE_URL || "http://localhost:54321/functions/v1";
+  const r = await fetch(`${url}/property-matching`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id, max_budget, preferred_districts, limit }) });
+  const j = await r.json();
+  res.status(r.ok ? 200 : 400).json(j);
+}
+TS
+
+cat > frontend/pages/api/recommendations.ts <<'TS'
+import type { NextApiRequest, NextApiResponse } from "next";
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== "POST") return res.status(405).end();
+  const { user_id, limit } = req.body || {};
+  const url = process.env.EDGE_BASE_URL || "http://localhost:54321/functions/v1";
+  const r = await fetch(`${url}/recommendation-engine`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id, limit }) });
+  const j = await r.json();
+  res.status(r.ok ? 200 : 400).json(j);
+}
+TS
+
+cat > frontend/pages/api/user-preferences.ts <<'TS'
+import type { NextApiRequest, NextApiResponse } from "next";
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const url = process.env.EDGE_BASE_URL || "http://localhost:54321/functions/v1";
+  const token = req.headers.authorization || "";
+  if (req.method === "GET") {
+    const r = await fetch(`${url}/user-preferences`, { headers: { Authorization: token as string } });
+    const j = await r.json();
+    return res.status(r.ok ? 200 : 400).json(j);
+  }
+  if (req.method === "POST" || req.method === "PUT") {
+    const r = await fetch(`${url}/user-preferences`, { method: req.method, headers: { "Content-Type": "application/json", Authorization: token as string }, body: JSON.stringify(req.body) });
+    const j = await r.json();
+    return res.status(r.ok ? 200 : 400).json(j);
+  }
+  return res.status(405).end();
+}
+TS
+
+# Helper: /api/me to get a fake user id for demo (replace with supabase client auth in real app)
+cat > frontend/pages/api/me.ts <<'TS'
+import type { NextApiRequest, NextApiResponse } from "next";
+export default async function handler(_req: NextApiRequest, res: NextApiResponse) {
+  // In real usage, call Supabase auth. For demo, return a placeholder UUID.
+  res.status(200).json({ user: { id: "00000000-0000-0000-0000-000000000000" } });
+}
+TS
+
+########################################
+# ai-models/recommendation-model.py
+########################################
+cat > ai-models/recommendation-model.py <<'PY'
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List, Dict
+
+@dataclass
+class Neighborhood:
+  name: str
+  safety: float
+  walk: float
+  metro: bool
+
+@dataclass
+class UserPrefs:
+  budget: float | None
+  districts: List[str]
+  weight_safety: float = 0.3
+  weight_metro: float = 0.2
+  weight_walk: float = 0.5
+
+def score(nei: Neighborhood, prefs: UserPrefs) -> float:
+  return nei.safety * prefs.weight_safety + (1.0 if nei.metro else 0.0) * prefs.weight_metro + nei.walk * prefs.weight_walk
+
+def recommend(neighborhoods: List[Neighborhood], prefs: UserPrefs, k: int = 5) -> List[Dict]:
+  ranked = sorted(({"name": n.name, "score": round(score(n, prefs), 4)} for n in neighborhoods), key=lambda x: x["score"], reverse=True)
+  return ranked[:k]
+
+if __name__ == "__main__":
+  demo = [Neighborhood("Centro", 0.7, 0.9, True), Neighborhood("Salamanca", 0.85, 0.8, True), Neighborhood("Lavapiés", 0.6, 0.95, True)]
+  prefs = UserPrefs(budget=1200, districts=["Centro", "Salamanca"])
+  print(recommend(demo, prefs))
+PY
+
+########################################
+# README
+########################################
+cat > README.md <<'MD'
+# Hala Madrid Housing 🏡
+
+Smart student housing discovery for Madrid using Supabase, Edge Functions, and Next.js.
+
+## Stack
+- **Database**: Postgres (Supabase), SQL functions + RLS policies
+- **APIs**: Supabase Edge Functions (Deno)
+- **Frontend**: Next.js (TypeScript)
+- **Models**: Python stub (replace with real recommender)
+
+## Getting Started
+### 1) Supabase (local)
+```bash
+supabase start
+supabase db push < database/schema.sql
+supabase db push < database/functions.sql
+supabase db push < database/policies.sql
+supabase functions deploy property-matching --project-ref local
+supabase functions deploy user-preferences --project-ref local
+supabase functions deploy recommendation-engine --project-ref local
+````
+
+### 2) Frontend
+
+cd frontend
+cp .env.local.example .env.local
+npm i
+npm run dev
+
